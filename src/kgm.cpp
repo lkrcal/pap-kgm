@@ -89,29 +89,36 @@ ostream& operator<< (ostream& out, const dfs_state& state);
 ostream& operator<< (ostream& out, const std::pair<dfs_state,ugraph>& state);
 ostream& operator<< (ostream& out, const dfs_stack& stack);
 
-// Runtime
 
-ugraph g; // private ( TODO needs to be copied via boost::graph::copy.hpp)
-uint32_t KGM_GRAPH_SIZE; // shared
-uint16_t KGM_UPPER_BOUND = 30; // shared
-uint32_t KGM_LOWER_BOUND = 2; // shared, fixed
+// RUNTIME -----------------------------------------------------
+
+//ugraph g; // TODO private ( TODO needs to be copied via boost::graph::copy.hpp,
+		  // cannot be made private by openmp's #pragma private)
+uint32_t KGM_GRAPH_SIZE; // shared, RO
+uint16_t KGM_UPPER_BOUND = 30; // shared // TODO add atomic to Write manimulation
+
+const uint32_t KGM_LOWER_BOUND = 2;
 const uint32_t KGM_START_NODE = 0;
 const uint64_t KGM_REPORT_INTERVAL = 0x10000000;
 const uint32_t KGM_GIVEAWAY_INTERVAL = 0x100;
-uint64_t KGM_REPORT_NEXT = KGM_REPORT_INTERVAL; // private (all thread reporting)
-uint64_t KGM_STEPS = 0;
+uint64_t KGM_REPORT_NEXT = KGM_REPORT_INTERVAL; // TODO private (all thread reporting)
+uint64_t KGM_STEPS = 0; // TODO private (all threads counting steps)
 
-boost::scoped_ptr<boost::timer> KGM_TIMER; // shared, may be private for all
-										   // threads to measure single thread span
-bool running = true; // private
+boost::scoped_ptr<boost::timer> KGM_TIMER; // shared
 
-kgm_task_queue KGM_TASK_QUEUE; // shared
+bool running = true; // TODO private
+
+kgm_task_queue KGM_TASK_QUEUE;
+
+// end (RUNTIME) -----------------------------------------------
+
 
 // TODO
 int openMpThreadNumber();
 // TODO
 int openMpTotalThreads();
-
+// TODO Optimal solution found
+void finish();
 
 bool isValid_dfs_state(const dfs_state& dfsState, const ugraph& graph)
 {
@@ -222,6 +229,7 @@ void sendFinish();
 void broadcastNewSolution(int);
 
 void dfs_step(
+		i_dfs_stack& inactiveDfsStack,
         dfs_stack& stack,
         degree_stack& degStack,
         ugraph& graph,
@@ -288,7 +296,7 @@ void dfs_step(
             stack.pop_back();
 }
 
-void readInputFromFile(std::string filename) {
+void readGraphFromFile(std::string filename, ugraph& g) {
 	std::ifstream in(filename.c_str());
 	std::stringstream buffer;
 	buffer << in.rdbuf();
@@ -298,7 +306,7 @@ void readInputFromFile(std::string filename) {
 	boost::split(lines, contents, boost::is_any_of("\n"));
 
 	int m = lines.size()-2, n = lines[lines.size()-2].length();
-	//std::cout << "loaded graph of size: " << m << "*" << n << std::endl;
+	std::cout << "loaded graph of size: " << m << "*" << n << std::endl;
 	KGM_GRAPH_SIZE = n;
 	if (m != n && m <= 1)
 	{
@@ -332,7 +340,7 @@ bool hasExtraWork(dfs_stack& dfsStack) {
 	return false;
 }
 
-bool giveWork(i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& degreeStack)
+bool giveWork(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& degreeStack)
 {
 	int difference, diffRatio;
 	kgm_vertex_iterator newVIt, newVIt_end;
@@ -358,8 +366,8 @@ bool giveWork(i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& 
 		return false;
     (*it).v_it_end = newVIt;
 
-    newTask->newVItStart = newVIt;
-    newTask->newVItEnd = newVIt_end;
+    newTask->newVItStart = (uint16_t)(*newVIt);
+    newTask->newVItEnd = (uint16_t)(*newVIt_end);
 
     newTask->degree = degreeStack.at(it-dfsStack.begin());
 
@@ -368,30 +376,30 @@ bool giveWork(i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& 
 	for (igit = inactiveDfsStack.begin(); igit != inactiveDfsStack.end(); ++igit)
 	{
 		i_dfs_state iDfsState;
-		iDfsState.v = (*igit).v
+		iDfsState.v = (*igit).v;
 		iDfsState.a = (*igit).a;
 		newTask->inactiveDfsStack.push_back(iDfsState);
 	}
 	for (git = dfsStack.begin(); git != it; ++git)
 	{
 		i_dfs_state iDfsState;
-		iDfsState.v = (uint16_t)(*((*git).v_it))
+		iDfsState.v = (uint16_t)(*((*git).v_it));
 		iDfsState.a = (uint16_t)(*((*git).a_it));
 		newTask->inactiveDfsStack.push_back(iDfsState);
 	}
 
-	#pragma omp critical(KGM_TASK_LIST)
+	#pragma omp critical(kgmtasklist)
 	{
 		KGM_TASK_QUEUE.push(newTask);
 	}
 	return true;
 }
 
-bool grabWork(i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& degreeStack)
+bool grabWork(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& degreeStack)
 {
 	kgm_task grabbedTask;
 	bool ok;
-	#pragma omp critical(KGM_TASK_LIST)
+	#pragma omp critical(kgmtasklist)
 	{
 		if (KGM_TASK_QUEUE.empty())
 			ok = false;
@@ -422,7 +430,7 @@ bool grabWork(i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& 
 	inactiveDfsStack.clear();
 
 	// Initialize graph state from task
-	for (i_dfs_stack::iterator it = grabbedTask->inactiveDfsStack;
+	for (i_dfs_stack::iterator it = grabbedTask->inactiveDfsStack.begin();
 				it != grabbedTask->inactiveDfsStack.end(); ++it)
 	{
 		i_dfs_state istate;
@@ -471,16 +479,16 @@ bool grabWork(i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& 
 }
 
 
-void divideWork() {
+void divideWork(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& degreeStack) {
     std::cout << ": divideWork()" << std::endl;
-	int processNumber = 1; // starting with the next process
-	while(hasExtraWork() && processNumber < openMpTotalThreads()) {
-		sendWork(processNumber);
-		++processNumber;
+	int threadNum = 0;
+	while(hasExtraWork(dfsStack) && threadNum < openMpTotalThreads()) {
+		giveWork(g, inactiveDfsStack, dfsStack, degreeStack);
+		++threadNum;
 	}
 }
 
-void initStack() {
+void initStack(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& degreeStack) {
 	dfs_state firstState;
 	g[KGM_START_NODE].state = true;
 	if (!create_dfs_state(firstState,g))
@@ -493,7 +501,7 @@ void initStack() {
 }
 
 
-void iterateStack() {
+void iterateStack(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& degreeStack) {
 
 	while(running) {
 		while (!dfsStack.empty())
@@ -503,7 +511,7 @@ void iterateStack() {
 			if (dfsStack.empty())
 				break;
 
-			dfs_step(dfsStack, degreeStack, g, KGM_UPPER_BOUND);
+			dfs_step(inactiveDfsStack, dfsStack, degreeStack, g, KGM_UPPER_BOUND);
 
 			if (KGM_STEPS >= KGM_REPORT_NEXT)
 			{
@@ -513,7 +521,8 @@ void iterateStack() {
 			}
 		}
 
-		if (!grabWork())
+		// TODO end on first failure is too broadminded
+		if (!grabWork(g, inactiveDfsStack, dfsStack, degreeStack))
 			running = false;
 	}
 
@@ -530,15 +539,23 @@ int main(int argc, char ** argv) {
     std::string filename (argv[1]);
 	if (filename.empty())
 		return -1;
+	ugraph prototype;
+	readGraphFromFile(filename, prototype);
 
-	readInputFromFile(filename);
 
-    initStack();
+	i_dfs_stack inactiveDfsStack;
+	dfs_stack dfsStack;
+	degree_stack degreeStack;
+	ugraph g; // TODO copy
+    initStack(g, inactiveDfsStack, dfsStack, degreeStack);
 
+    // TODO run for some time (expand)
+
+    // TODO divide work
 
     KGM_TIMER.reset(new boost::timer);
 
-    iterateStack();
+    iterateStack(g, inactiveDfsStack, dfsStack, degreeStack);
 
 	std::cout << ": ***** ENDED in time " << KGM_TIMER->elapsed() << std::endl;
 
