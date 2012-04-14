@@ -23,6 +23,7 @@
 #include <utility>
 #include <fstream>
 #include <stack>
+#include <queue>
 
 #include <stdint.h>
 
@@ -69,8 +70,18 @@ struct i_dfs_state {
 };
 typedef std::vector<dfs_state> dfs_stack;
 typedef std::vector<i_dfs_state> i_dfs_stack;
-typedef std::stack<kgm_edge_descriptor> kgm_stack;
 typedef std::vector<uint16_t> degree_stack;
+
+struct kgm_task_struct
+{
+	std::vector<i_dfs_state> inactiveDfsStack;
+	uint16_t newVItStart;
+	uint16_t newVItEnd;
+	uint16_t degree;
+};
+
+typedef boost::shared_ptr<kgm_task_struct> kgm_task;
+typedef std::queue<kgm_task> kgm_task_queue;
 
 ostream& operator<< (ostream& out, const kgm_adjacency_iterator& ai);
 ostream& operator<< (ostream& out, const kgm_vertex_iterator& ai);
@@ -80,11 +91,13 @@ ostream& operator<< (ostream& out, const dfs_stack& stack);
 
 // Runtime
 
+ugraph g; // private ( TODO needs to be copied via boost::graph::copy.hpp)
 uint32_t KGM_GRAPH_SIZE; // shared
 uint16_t KGM_UPPER_BOUND = 30; // shared
 uint32_t KGM_LOWER_BOUND = 2; // shared, fixed
 const uint32_t KGM_START_NODE = 0;
 const uint64_t KGM_REPORT_INTERVAL = 0x10000000;
+const uint32_t KGM_GIVEAWAY_INTERVAL = 0x100;
 uint64_t KGM_REPORT_NEXT = KGM_REPORT_INTERVAL; // private (all thread reporting)
 uint64_t KGM_STEPS = 0;
 
@@ -92,15 +105,12 @@ boost::scoped_ptr<boost::timer> KGM_TIMER; // shared, may be private for all
 										   // threads to measure single thread span
 bool running = true; // private
 
+kgm_task_queue KGM_TASK_QUEUE; // shared
+
 // TODO
 int openMpThreadNumber();
 // TODO
 int openMpTotalThreads();
-
-ugraph g; //shared
-i_dfs_stack inactiveDfsStack; //private
-dfs_stack dfsStack; //private
-degree_stack degreeStack; //private
 
 
 bool isValid_dfs_state(const dfs_state& dfsState, const ugraph& graph)
@@ -252,9 +262,9 @@ void dfs_step(
         {
             degreeLimit = degStack.back();
             // TODO possible spanning tree improvement
-            std::cout << openMpNumber() << ": New spanning tree of degree: "<< degreeLimit << std::endl
-                    << openMpNumber() << ": " << inactiveDfsStack << stack << std::endl
-                    << openMpNumber() << ": of total size: " << inactiveDfsStack.size() + stack.size() << std::endl;
+            std::cout << openMpThreadNumber() << ": New spanning tree of degree: "<< degreeLimit << std::endl
+                    << openMpThreadNumber() << ": " << inactiveDfsStack << stack << std::endl
+                    << openMpThreadNumber() << ": of total size: " << inactiveDfsStack.size() + stack.size() << std::endl;
 
             if(degreeLimit == KGM_LOWER_BOUND)
                 sendFinish();
@@ -311,7 +321,7 @@ void readInputFromFile(std::string filename) {
 	}
 }
 
-bool hasExtraWork() {
+bool hasExtraWork(dfs_stack& dfsStack) {
     if (dfsStack.size() <= 1)
         return false;
     for (dfs_stack::iterator it = dfsStack.begin(); it < (dfsStack.end()-1); ++it)
@@ -322,196 +332,142 @@ bool hasExtraWork() {
 	return false;
 }
 
+bool giveWork(i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& degreeStack)
+{
+	int difference, diffRatio;
+	kgm_vertex_iterator newVIt, newVIt_end;
+	dfs_stack::iterator it;
+	bool ok = false;
 
-// TODO Merge sendWork and GrabWork into single function grabWork, that operates
-// on shared central (or thread-specific) stacks.
-bool grabWork();
+	kgm_task newTask;
 
-void sendWork(int processNumber) {
-    int difference, diffRatio;
-    kgm_vertex_iterator newVIt, newVIt_end;
-    dfs_stack::iterator it;
-    bool ok = false;
-
-    for (it = dfsStack.begin(); it < (dfsStack.end()-1); ++it)
-    {
-        difference = (*it).v_it_end-(*it).v_it;
-        if (difference > 1)
-        {
-            diffRatio = ((*it).v_it_end-(*it).v_it+1)/2;
-            newVIt = (*it).v_it+diffRatio;
-            newVIt_end = (*it).v_it_end;
-            ok = true;
-            break;
-        }
-    }
-    if (!ok)
-        return;
+	// Cuts off last state from active stack
+	for (it = dfsStack.begin(); it < (dfsStack.end()-1); ++it)
+	{
+		difference = (*it).v_it_end-(*it).v_it;
+		if (difference > 1)
+		{
+			diffRatio = ((*it).v_it_end-(*it).v_it+1)/2;
+			newVIt = (*it).v_it+diffRatio;
+			newVIt_end = (*it).v_it_end;
+			ok = true;
+			break;
+		}
+	}
+	if (!ok)
+		return false;
     (*it).v_it_end = newVIt;
 
-    char* outputBuffer = new char [sizeof(uint16_t)*(KGM_GRAPH_SIZE*2 + 5)];
-    uint16_t* outputBuffer16 = (uint16_t*) outputBuffer;
-    int i = 1, cnt = 0;
-    std::cout << MPI_MY_RANK << ": sending work - degree at level: " << it-dfsStack.begin()
-            <<"( of"<< degreeStack.size() << ") = " << degreeStack.at(it-dfsStack.begin()) << std::endl;
-    outputBuffer16[i++] = (uint16_t)(degreeStack.at(it-dfsStack.begin())); // spanning tree degree
-    outputBuffer16[i++] = (uint16_t)(*newVIt); // starting state - v_it
-    outputBuffer16[i++] = (uint16_t)(*newVIt_end); // starting state - v_it_end
+    newTask->newVItStart = newVIt;
+    newTask->newVItEnd = newVIt_end;
+
+    newTask->degree = degreeStack.at(it-dfsStack.begin());
+
     dfs_stack::iterator git;
-    i_dfs_stack::iterator igit;
-//    ++it;
-    for (igit = inactiveDfsStack.begin(); igit != inactiveDfsStack.end(); ++igit)
-    {
-        outputBuffer16[i++] = (*igit).v;
-        outputBuffer16[i++] = (*igit).a;
-        ++cnt;
-    }
-    for (git = dfsStack.begin(); git != it; ++git)
-    {
-        outputBuffer16[i++] = (uint16_t)(*((*git).v_it));
-        outputBuffer16[i++] = (uint16_t)(*((*git).a_it));
-        ++cnt;
-    }
-    outputBuffer16[0] = (uint16_t)(cnt); // number of visited states - depth
-    outputBuffer16[i++] = (uint16_t) 0; // terminating 00 bytes
+	i_dfs_stack::iterator igit;
+	for (igit = inactiveDfsStack.begin(); igit != inactiveDfsStack.end(); ++igit)
+	{
+		i_dfs_state iDfsState;
+		iDfsState.v = (*igit).v
+		iDfsState.a = (*igit).a;
+		newTask->inactiveDfsStack.push_back(iDfsState);
+	}
+	for (git = dfsStack.begin(); git != it; ++git)
+	{
+		i_dfs_state iDfsState;
+		iDfsState.v = (uint16_t)(*((*git).v_it))
+		iDfsState.a = (uint16_t)(*((*git).a_it));
+		newTask->inactiveDfsStack.push_back(iDfsState);
+	}
 
-    std::stringstream ss;
-    ss << "[ ";
-    for (int j = 0; j < i; ++j)
-    {
-        ss << outputBuffer16[j] << " ";
-    }
-    ss << "]";
-    std::cout << MPI_MY_RANK << ": sent work - length (of uint16_t): " << i
-            << " to " << processNumber << std::endl
-            << ss.str() << std::endl;
-
-    MPI_Send (outputBuffer, i*sizeof(uint16_t), MPI_CHAR, processNumber, MSG_WORK_SENT, MPI_COMM_WORLD);
-    delete[] outputBuffer;
-
-    /*std::cout << MPI_MY_RANK << ": my stack after send: " << std::endl
-            << dfsStack << std::endl;*/
+	#pragma omp critical(KGM_TASK_LIST)
+	{
+		KGM_TASK_QUEUE.push(newTask);
+	}
+	return true;
 }
 
-void acceptWork(MPI_Status& status) {
-    int maxInputBufferSize = sizeof(uint16_t)*(KGM_GRAPH_SIZE*2 + 5), receivedNum;
-    char* inputBuffer = new char [maxInputBufferSize];
-    uint16_t* inputBuffer16 = (uint16_t*) inputBuffer;
-
-    MPI_Recv(inputBuffer, maxInputBufferSize, MPI_CHAR, status.MPI_SOURCE, MSG_WORK_SENT, MPI_COMM_WORLD, &status);
-    MPI_Get_count(&status, MPI_CHAR, &receivedNum);
-
-    int total16 = receivedNum / sizeof(uint16_t); // uint16_t index
-    std::stringstream ss;
-    ss << "[ ";
-    for (int i = 0; i < total16; ++i)
-    {
-        ss << inputBuffer16[i] << " ";
-    }
-    ss << "]";
-    std::cout << MPI_MY_RANK << ": received work - length (of uint16_t): " << total16
-            << " from " << status.MPI_SOURCE << std::endl
-            << MPI_MY_RANK << ": " << ss.str() << std::endl;
-
-    if (inputBuffer16[total16-1] != 0)
-    {
-        std::cout << MPI_MY_RANK <<
-                ": ERROR - acceptWork char* bad format - LAST UINT16_T != 0" << std::endl
-                << "inputBuffer[total16-1] = " << inputBuffer[total16-1] << std::endl
-                << "total16 = " << total16 << std::endl;
-        throw("ERROR - acceptWork char* bad format - LAST UINT16_T != 0");
-    }
-    else {
-        /*std::cout << MPI_MY_RANK <<
-                ": OK - acceptWork char* valid format - LAST UINT16_T == 0" << std::endl;*/
-    }
-
-    int numberOfEdgesBefore = inputBuffer16[0];
+bool grabWork(i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& degreeStack)
+{
+	kgm_task grabbedTask;
+	bool ok;
+	#pragma omp critical(KGM_TASK_LIST)
+	{
+		if (KGM_TASK_QUEUE.empty())
+			ok = false;
+		else
+		{
+			grabbedTask = KGM_TASK_QUEUE.front();
+			KGM_TASK_QUEUE.pop();
+		}
+	}
+	if (!ok)
+		return false;
 
     // Clear degree stack, put first state's degree into the stack
-    degreeStack.clear();
-    degreeStack.push_back(inputBuffer16[1]);
+	degreeStack.clear();
+	degreeStack.push_back(grabbedTask->degree);
 
-    // Clear graph state
-    kgm_vertex_iterator vi, vi_end;
-    tie(vi, vi_end) = vertices(g);
-    g[(*vi)].state = true;
-    g[(*vi)].degree = 0;
-    ++vi;
-    for (; vi != vi_end; ++vi)
-    {
-        g[(*vi)].state = false;
-        g[(*vi)].degree = 0;
-    }
-    inactiveDfsStack.clear();
+	// Clear graph state
+	kgm_vertex_iterator vi, vi_end;
+	tie(vi, vi_end) = vertices(g);
+	g[(*vi)].state = true;
+	g[(*vi)].degree = 0;
+	++vi;
+	for (; vi != vi_end; ++vi)
+	{
+		g[(*vi)].state = false;
+		g[(*vi)].degree = 0;
+	}
+	inactiveDfsStack.clear();
 
-    // Initialize graph state from message
-    int visitedEdgesCnt = 0;
-//    g[inputBuffer16[2]].state = true;
-    for (int j = 4, j_end = total16-1; j < j_end; j+=2)
-    {
-        i_dfs_state istate;
-        istate.v = inputBuffer16[j];
-        istate.a = inputBuffer16[j+1];
-        inactiveDfsStack.push_back(istate);
-        g[inputBuffer16[j]].state = true;
-        g[inputBuffer16[j]].degree++;
-        g[inputBuffer16[j+1]].state = true;
-        g[inputBuffer16[j+1]].degree++;
-        ++visitedEdgesCnt;
-    }
-    if (numberOfEdgesBefore != visitedEdgesCnt)
-    {
-        std::cout << MPI_MY_RANK <<
-                ": ERROR - acceptWork char* bad format - inputBuffer16[0] != visited nodes" << std::endl
-                << "numberOfEdgesBefore = inputBuffer16[0] = " << inputBuffer16[0] << std::endl
-                << "visitedEdgesCnt = " << visitedEdgesCnt << std::endl;
-        throw("ERROR - acceptWork char* bad format - inputBuffer16[0] != visited edges");
-    }
-    else
-    {
-        /*std::cout << MPI_MY_RANK <<
-                ": OK - acceptWork char* valid format - inputBuffer16[0] == visited edges" << std::endl
-                << "numberOfEdgesBefore = inputBuffer16[0] = " << inputBuffer16[0] << std::endl
-                << "visitedEdgesCnt = " << visitedEdgesCnt << std::endl;*/
-    }
+	// Initialize graph state from task
+	for (i_dfs_stack::iterator it = grabbedTask->inactiveDfsStack;
+				it != grabbedTask->inactiveDfsStack.end(); ++it)
+	{
+		i_dfs_state istate;
+		istate.v = (*it).v;
+		istate.a = (*it).a;
+		inactiveDfsStack.push_back(istate);
+		g[istate.v].state = true;
+		g[istate.v].degree++;
+		g[istate.a].state = true;
+		g[istate.a].degree++;
+	}
 
-    // Clear dfs stack and initialize first state
-    dfsStack.clear();
-    dfs_state firstState;
-    tie(firstState.v_it, firstState.v_it_end) = vertices(g);
-    firstState.v_it += inputBuffer16[2];
-    firstState.v_it_end = firstState.v_it + (inputBuffer16[3] - inputBuffer16[2]);
-    std::cout << MPI_MY_RANK << ": firstState.v_it_end = firstState.v_it + "
-            << inputBuffer16[3]-inputBuffer16[2] << std::endl;
-    tie(firstState.a_it, firstState.a_it_end) = adjacent_vertices(*(firstState.v_it),g);
+	dfsStack.clear();
+	dfs_state firstState;
+	tie(firstState.v_it, firstState.v_it_end) = vertices(g);
+	firstState.v_it += grabbedTask->newVItStart;
+	firstState.v_it_end = firstState.v_it + (grabbedTask->newVItEnd - grabbedTask->newVItStart);
+	std::cout << openMpThreadNumber() << ": firstState.v_it_end = firstState.v_it + "
+			<< grabbedTask->newVItEnd-grabbedTask->newVItStart << std::endl;
+	tie(firstState.a_it, firstState.a_it_end) = adjacent_vertices(*(firstState.v_it),g);
 
-    std::cout << MPI_MY_RANK << ": raw first state received: " << firstState << std::endl;
+	std::cout << openMpThreadNumber() << ": raw first state received: " << firstState << std::endl;
 
-    if (!isValid_dfs_state(firstState, g))
-    {
-        std::cout << MPI_MY_RANK << ": is invalid" << std::endl;
-        iterate_dfs_state(firstState, g);
-//        std::cout << MPI_MY_RANK << ": firstState.a_it: " << (uint16_t)(*(firstState.a_it)) << std::endl;
-//        std::cout << MPI_MY_RANK << ": firstState.a_it_end - a_it: " << (uint16_t)(firstState.a_it_end - firstState.a_it) << std::endl;
-        std::cout << MPI_MY_RANK << ": iterated to: " << firstState << std::endl;
-    } else {
-        std::cout << MPI_MY_RANK << ": is valid" << std::endl;
-    }
-    if (!isValid_dfs_state(firstState, g))
-    {
-        std::cout << MPI_MY_RANK << ": is invalid after iteration" << std::endl
-                  << MPI_MY_RANK << ": has accepted no valid work!" << std::endl;
-    }
-    else
-    {
-        std::cout << MPI_MY_RANK << ": successfully accepted work" << std::endl
-                << "   dfs stack size: " << dfsStack.size() << std::endl
-                << "   degree: " << degreeStack.back() << std::endl
-                << "   edges before this state: " << visitedEdgesCnt << std::endl;
-        dfsStack.push_back(firstState);
-    }
-
+	if (!isValid_dfs_state(firstState, g))
+	{
+		std::cout << openMpThreadNumber() << ": is invalid" << std::endl;
+		iterate_dfs_state(firstState, g);
+		std::cout << openMpThreadNumber() << ": iterated to: " << firstState << std::endl;
+	} else {
+		std::cout << openMpThreadNumber() << ": is valid" << std::endl;
+	}
+	if (!isValid_dfs_state(firstState, g))
+	{
+		std::cout << openMpThreadNumber() << ": is invalid after iteration" << std::endl
+				  << openMpThreadNumber() << ": has accepted no valid work!" << std::endl;
+	}
+	else
+	{
+		std::cout << openMpThreadNumber() << ": successfully accepted work" << std::endl
+				<< "   dfs stack size: " << dfsStack.size() << std::endl
+				<< "   degree: " << degreeStack.back() << std::endl
+				<< "   edges before this state: " << inactiveDfsStack.size() << std::endl;
+		dfsStack.push_back(firstState);
+	}
+	return true;
 }
 
 
