@@ -27,6 +27,7 @@
 
 #include <stdint.h>
 #include <omp.h>
+#include <time.h>
 
 using namespace std;
 using namespace boost;
@@ -92,38 +93,33 @@ ostream& operator<< (ostream& out, const dfs_stack& stack);
 
 // RUNTIME -----------------------------------------------------
 
-//ugraph g; // TODO private ( TODO needs to be copied via boost::graph::copy.hpp,
-		  // cannot be made private by openmp's #pragma private)
-uint32_t KGM_GRAPH_SIZE; // shared, RO
-uint16_t KGM_UPPER_BOUND = 30; // shared // TODO add atomic to Write manimulation
+uint32_t KGM_GRAPH_SIZE;
+uint16_t KGM_UPPER_BOUND = 30;
 
 const uint32_t KGM_LOWER_BOUND = 2;
 const uint32_t KGM_START_NODE = 0;
-//const uint64_t KGM_REPORT_INTERVAL = 0x10000000;
 const uint64_t KGM_REPORT_INTERVAL = 0x100000;
 const uint32_t KGM_GIVEAWAY_INTERVAL = 0x1000;
 
-boost::scoped_ptr<boost::timer> KGM_TIMER; // shared
+const uint32_t NUMBER_OF_THREADS = 64;
 
-bool running = true; // TODO private
-uint16_t stoppedThreads = 0; // TODO shared
+boost::scoped_ptr<boost::timer> KGM_TIMER;
+
+uint16_t stoppedThreads = 0;
 
 uint32_t KGM_TASK_COUNTER = 0;
 kgm_task_queue KGM_TASK_QUEUE;
 
+uint16_t finalDegree = KGM_UPPER_BOUND;
+i_dfs_stack finalInactiveDfsStack;
+dfs_stack finalDfsStack;
+
 // end (RUNTIME) -----------------------------------------------
 
 
-int openMpThreadNumber()
-{
-	return omp_get_thread_num();
-}
-int openMpTotalThreads()
-{
-	return omp_get_num_threads();
-}
-// TODO Optimal solution found
-void finish();
+inline int openMpThreadNumber(){return omp_get_thread_num();}
+
+inline int openMpTotalThreads(){return omp_get_num_threads();}
 
 bool isValid_dfs_state(const dfs_state& dfsState, const ugraph& graph)
 {
@@ -235,7 +231,7 @@ void dfs_step(
         dfs_stack& stack,
         degree_stack& degStack,
         ugraph& graph,
-        uint16_t& degreeLimit) // so far the lowest skeleton degree
+        uint16_t& degreeLimit) // so far the lowest spanning tree degree
 {
     if (stack.empty())
         return;
@@ -271,11 +267,16 @@ void dfs_step(
         else
         {
             degreeLimit = degStack.back();
-            // TODO possible spanning tree improvement
             std::cout << openMpThreadNumber() << ": New spanning tree of degree: "<< degreeLimit << std::endl
                     << openMpThreadNumber() << ": " << inactiveDfsStack << stack << std::endl
                     << openMpThreadNumber() << ": of total size: " << inactiveDfsStack.size() + stack.size() << std::endl;
 
+			#pragma omp critical(newSpanningTree)
+            {
+            	finalDegree = degreeLimit;
+            	finalInactiveDfsStack = inactiveDfsStack;
+            	finalDfsStack = stack;
+            }
 
 			#pragma omp critical(kgmUpperBound)
 			{
@@ -405,7 +406,10 @@ bool giveWork(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, deg
 		newTask->id = KGM_TASK_COUNTER++;
 	}
 
-	std::cout << openMpThreadNumber() << ": Giving away task " << newTask->id << std::endl;
+	#ifdef VERBOSE
+		std::cout << openMpThreadNumber() << ": Giving away task " << newTask->id << std::endl;
+	#endif
+
 	#pragma omp critical(kgmtasklist)
 	{
 		KGM_TASK_QUEUE.push(newTask);
@@ -419,8 +423,6 @@ bool grabWork(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, deg
 	bool ok = true;
 	#pragma omp critical(kgmtasklist)
 	{
-//		std::cout << openMpThreadNumber() << ": KGM_TASK_QUEUE.size(): " << KGM_TASK_QUEUE.size() << std::endl;
-//		std::cout << openMpThreadNumber() << ": KGM_TASK_QUEUE.empty(): " << KGM_TASK_QUEUE.empty() << std::endl;
 		if (KGM_TASK_QUEUE.empty())
 			ok = false;
 		else
@@ -431,8 +433,10 @@ bool grabWork(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, deg
 	}
 	if (!ok)
 		return false;
-	std::cout << openMpThreadNumber() << ": Accepted task " << grabbedTask->id << std::endl;
 
+	#ifdef VERBOSE
+		std::cout << openMpThreadNumber() << ": Accepted task " << grabbedTask->id << std::endl;
+	#endif
     // Clear degree stack, put first state's degree into the stack
 	degreeStack.clear();
 	degreeStack.push_back(grabbedTask->degree);
@@ -469,33 +473,12 @@ bool grabWork(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, deg
 	tie(firstState.v_it, firstState.v_it_end) = vertices(g);
 	firstState.v_it += grabbedTask->newVItStart;
 	firstState.v_it_end = firstState.v_it + (grabbedTask->newVItEnd - grabbedTask->newVItStart);
-//	std::cout << openMpThreadNumber() << ": firstState.v_it_end = firstState.v_it + "
-//			<< grabbedTask->newVItEnd-grabbedTask->newVItStart << std::endl;
 	tie(firstState.a_it, firstState.a_it_end) = adjacent_vertices(*(firstState.v_it),g);
 
-//	std::cout << openMpThreadNumber() << ": raw first state received: " << firstState << std::endl;
-
 	if (!isValid_dfs_state(firstState, g))
-	{
-//		std::cout << openMpThreadNumber() << ": is invalid" << std::endl;
 		iterate_dfs_state(firstState, g);
-//		std::cout << openMpThreadNumber() << ": iterated to: " << firstState << std::endl;
-	} else {
-//		std::cout << openMpThreadNumber() << ": is valid" << std::endl;
-	}
-	if (!isValid_dfs_state(firstState, g))
-	{
-//		std::cout << openMpThreadNumber() << ": is invalid after iteration" << std::endl
-//				  << openMpThreadNumber() << ": has accepted no valid work!" << std::endl;
-	}
-	else
-	{
-//		std::cout << openMpThreadNumber() << ": successfully accepted work" << std::endl
-//				<< "   dfs stack size: " << dfsStack.size() << std::endl
-//				<< "   degree: " << degreeStack.back() << std::endl
-//				<< "   edges before this state: " << inactiveDfsStack.size() << std::endl;
+	if (isValid_dfs_state(firstState, g))
 		dfsStack.push_back(firstState);
-	}
 	return true;
 }
 
@@ -522,41 +505,29 @@ void initStack(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, de
 }
 
 
-void iterateStack(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& degreeStack) {
+void iterateStack(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& degreeStack, bool& running) {
 
 	uint64_t KGM_REPORT_NEXT = KGM_REPORT_INTERVAL;
+	uint64_t KGM_GIVEAWAY_NEXT = KGM_GIVEAWAY_INTERVAL;
 	uint64_t KGM_STEPS = 0;
 
-	while(running) {
+	while(true) {
 		while (!dfsStack.empty())
 		{
 			++KGM_STEPS;
 
-//			if (dfsStack.empty())
-//				break;
-
-
 			dfs_step(inactiveDfsStack, dfsStack, degreeStack, g, KGM_UPPER_BOUND);
 
-			if (KGM_STEPS % KGM_GIVEAWAY_INTERVAL == 0)
+			if (KGM_STEPS >= KGM_GIVEAWAY_NEXT)
 			{
-//				std::cout << openMpThreadNumber() << ": " << "Attepmting to give away work..." << std::endl;
-				if (giveWork(g, inactiveDfsStack, dfsStack, degreeStack))
-				{
-//					std::cout << openMpThreadNumber() << ": " << "Attepmt to give away work successful" << std::endl;
-//					std::cout << "S";
-				}
-				else
-				{
-//					std::cout << openMpThreadNumber() << ": " << "Attempt to give away work failed" << std::endl;
-//					std::cout << "F";
-				}
-
+				giveWork(g, inactiveDfsStack, dfsStack, degreeStack);
+				KGM_GIVEAWAY_NEXT += KGM_GIVEAWAY_INTERVAL;
 			}
+
 
 			if (KGM_STEPS >= KGM_REPORT_NEXT)
 			{
-				std::cout << ": Stack report at " << KGM_TIMER->elapsed() << ":" << std::endl
+				std::cout << openMpThreadNumber() << ": Stack report at " << KGM_TIMER->elapsed() << ":" << std::endl
 						<< inactiveDfsStack << dfsStack << std::endl;
 				KGM_REPORT_NEXT += KGM_REPORT_INTERVAL;
 			}
@@ -564,23 +535,29 @@ void iterateStack(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack,
 
 		if (stoppedThreads >= openMpTotalThreads())
 		{
-			std::cout << openMpThreadNumber() << ": " << "Finished (optimal solution found)!" << std::endl;
+			std::cout << openMpThreadNumber() << ": " << "Finished!" << std::endl;
 			running = false;
 			break;
 		}
 
-//		std::cout << openMpThreadNumber() << ": " << "grabbing work" << std::endl;
-		// TODO end on first failure is too broadminded
 		if (!grabWork(g, inactiveDfsStack, dfsStack, degreeStack))
 		{
-			std::cout << openMpThreadNumber() << ": " << "Finished, no more work." << std::endl;
-			running = false;
-			#pragma omp atomic
-				stoppedThreads++;
+			if (running)
+			{
+				running = false;
+				#pragma omp atomic
+					stoppedThreads++;
+			}
+			usleep(1000);
 		}
 		else
 		{
-//			std::cout << openMpThreadNumber() << ": " << "grabbed work" << std::endl;
+			if (!running)
+			{
+				running = true;
+				#pragma omp atomic
+					stoppedThreads--;
+			}
 		}
 	}
 
@@ -604,19 +581,40 @@ int main(int argc, char ** argv) {
 	i_dfs_stack inactiveDfsStack;
 	dfs_stack dfsStack;
 	degree_stack degreeStack;
-	ugraph g; // TODO copy
-    initStack(prototype, inactiveDfsStack, dfsStack, degreeStack);
-
-    // TODO run for some time (expand)
-
-    // TODO divide work
-
     KGM_TIMER.reset(new boost::timer);
+    int startTime, endTime, totalTime;
+    startTime = time(NULL);
 
-    iterateStack(prototype, inactiveDfsStack, dfsStack, degreeStack);
+	#pragma omp parallel \
+		private(inactiveDfsStack,dfsStack,degreeStack) \
+		shared(KGM_TASK_COUNTER, KGM_TASK_QUEUE,KGM_UPPER_BOUND,stoppedThreads) \
+		num_threads(NUMBER_OF_THREADS)
+    {
 
-	std::cout << ": ***** ENDED in time " << KGM_TIMER->elapsed() << std::endl;
+		ugraph g;
+		#pragma omp critical(ugraphCopy)
+    	{
+			g = prototype;
+    	}
+    	bool running = true;
 
+		#pragma omp master
+    	{
+    		initStack(g, inactiveDfsStack, dfsStack, degreeStack);
+    	}
+		iterateStack(g, inactiveDfsStack, dfsStack, degreeStack, running);
+    }
+
+    endTime = time(NULL);
+	totalTime = endTime - startTime;
+
+	std::cout << ": *****************************************" << std::endl;
+	std::cout << ": ***** CPU TIME : " << KGM_TIMER->elapsed() << std::endl;
+	std::cout << ": ***** REAL TIME : " << totalTime << std::endl;
+	std::cout << ": ***** THREADS: " << NUMBER_OF_THREADS << std::endl;
+	std::cout << ": ***** DEGREE: " << finalDegree << std::endl;
+	std::cout << ": ***** SPANNING TREE: " << finalInactiveDfsStack << finalDfsStack << std::endl;
+	std::cout << ": *****************************************" << std::endl;
 	return 0;
 }
 
