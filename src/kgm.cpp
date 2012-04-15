@@ -26,8 +26,7 @@
 #include <queue>
 
 #include <stdint.h>
-
-#include <pthread.h>
+#include <omp.h>
 
 using namespace std;
 using namespace boost;
@@ -101,22 +100,25 @@ const uint32_t KGM_LOWER_BOUND = 2;
 const uint32_t KGM_START_NODE = 0;
 const uint64_t KGM_REPORT_INTERVAL = 0x10000000;
 const uint32_t KGM_GIVEAWAY_INTERVAL = 0x100;
-uint64_t KGM_REPORT_NEXT = KGM_REPORT_INTERVAL; // TODO private (all thread reporting)
-uint64_t KGM_STEPS = 0; // TODO private (all threads counting steps)
 
 boost::scoped_ptr<boost::timer> KGM_TIMER; // shared
 
 bool running = true; // TODO private
+uint16_t stoppedThreads = 0; // TODO shared
 
 kgm_task_queue KGM_TASK_QUEUE;
 
 // end (RUNTIME) -----------------------------------------------
 
 
-// TODO
-int openMpThreadNumber();
-// TODO
-int openMpTotalThreads();
+int openMpThreadNumber()
+{
+	return omp_get_thread_num();
+}
+int openMpTotalThreads()
+{
+	return omp_get_num_threads();
+}
 // TODO Optimal solution found
 void finish();
 
@@ -225,9 +227,6 @@ ostream& operator<< (ostream& out, const i_dfs_stack& stack)
     return out;
 }
 
-void sendFinish();
-void broadcastNewSolution(int);
-
 void dfs_step(
 		i_dfs_stack& inactiveDfsStack,
         dfs_stack& stack,
@@ -274,10 +273,20 @@ void dfs_step(
                     << openMpThreadNumber() << ": " << inactiveDfsStack << stack << std::endl
                     << openMpThreadNumber() << ": of total size: " << inactiveDfsStack.size() + stack.size() << std::endl;
 
+
+			#pragma omp critical(kgmUpperBound)
+			{
+            	if (degreeLimit < KGM_UPPER_BOUND)
+            		KGM_UPPER_BOUND = degreeLimit;
+			}
             if(degreeLimit == KGM_LOWER_BOUND)
-                sendFinish();
-            else
-                broadcastNewSolution(degreeLimit);
+            {
+            	// Terminate all threads
+				#pragma omp critical(stoppedThreads)
+            	{
+            		stoppedThreads = openMpTotalThreads();
+            	}
+            }
         }
 
         return;
@@ -503,6 +512,9 @@ void initStack(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, de
 
 void iterateStack(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, degree_stack& degreeStack) {
 
+	uint64_t KGM_REPORT_NEXT = KGM_REPORT_INTERVAL;
+	uint64_t KGM_STEPS = 0;
+
 	while(running) {
 		while (!dfsStack.empty())
 		{
@@ -511,7 +523,22 @@ void iterateStack(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack,
 			if (dfsStack.empty())
 				break;
 
+
 			dfs_step(inactiveDfsStack, dfsStack, degreeStack, g, KGM_UPPER_BOUND);
+
+			if (KGM_STEPS % KGM_GIVEAWAY_INTERVAL == 0)
+			{
+				std::cout << openMpThreadNumber() << ": " << "Attepmting to give away work..." << std::endl;
+				if (giveWork(g, inactiveDfsStack, dfsStack, degreeStack))
+				{
+					std::cout << openMpThreadNumber() << ": " << "Attepmt to give away work successful" << std::endl;
+				}
+				else
+				{
+					std::cout << openMpThreadNumber() << ": " << "Attempt to give away work successful" << std::endl;
+				}
+
+			}
 
 			if (KGM_STEPS >= KGM_REPORT_NEXT)
 			{
@@ -521,9 +548,21 @@ void iterateStack(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack,
 			}
 		}
 
+		if (stoppedThreads >= openMpTotalThreads())
+		{
+			std::cout << openMpThreadNumber() << ": " << "finished (optimal solution found)" << std::endl;
+			running = false;
+			break;
+		}
+
 		// TODO end on first failure is too broadminded
 		if (!grabWork(g, inactiveDfsStack, dfsStack, degreeStack))
+		{
+			std::cout << openMpThreadNumber() << ": " << "finished" << std::endl;
 			running = false;
+			#pragma omp atomic
+			stoppedThreads++;
+		}
 	}
 
 }
