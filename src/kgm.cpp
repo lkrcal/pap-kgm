@@ -357,6 +357,7 @@ bool giveWork(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack, deg
 	bool ok = false;
 
 	kgm_task newTask;
+	newTask.reset(new kgm_task_struct);
 
 	// Cuts off last state from active stack
 	for (it = dfsStack.begin(); it < (dfsStack.end()-1); ++it)
@@ -586,7 +587,7 @@ int main(int argc, char ** argv) {
 	dfs_stack dfsStack;
 	degree_stack degreeStack;
 	ugraph g; // TODO copy
-    initStack(g, inactiveDfsStack, dfsStack, degreeStack);
+    initStack(prototype, inactiveDfsStack, dfsStack, degreeStack);
 
     // TODO run for some time (expand)
 
@@ -594,7 +595,7 @@ int main(int argc, char ** argv) {
 
     KGM_TIMER.reset(new boost::timer);
 
-    iterateStack(g, inactiveDfsStack, dfsStack, degreeStack);
+    iterateStack(prototype, inactiveDfsStack, dfsStack, degreeStack);
 
 	std::cout << ": ***** ENDED in time " << KGM_TIMER->elapsed() << std::endl;
 
