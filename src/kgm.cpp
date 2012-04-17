@@ -1,11 +1,13 @@
 /**
  *  \file kgm.cpp
  *  \brief KGM
- *  \author krcallub, varkoale
+ *  \author krcallub, kopecji5, varkoale
  *  \version 0.1
  *
  *  --
  */
+
+#define _POSIX_C_SOURCE 199309L
 
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/tuple/tuple.hpp>
@@ -25,9 +27,11 @@
 #include <stack>
 #include <queue>
 
+#include <stddef.h>
 #include <stdint.h>
 #include <omp.h>
 #include <time.h>
+#include <ctime>
 
 using namespace std;
 using namespace boost;
@@ -98,10 +102,10 @@ uint16_t KGM_UPPER_BOUND = 30;
 
 const uint32_t KGM_LOWER_BOUND = 2;
 const uint32_t KGM_START_NODE = 0;
-const uint64_t KGM_REPORT_INTERVAL = 0x100000;
-const uint32_t KGM_GIVEAWAY_INTERVAL = 0x1000;
+const uint64_t KGM_REPORT_INTERVAL = 0x10000000;
+const uint32_t KGM_GIVEAWAY_INTERVAL = 0x10000;
 
-const uint32_t NUMBER_OF_THREADS = 64;
+uint32_t NUMBER_OF_THREADS;
 
 boost::scoped_ptr<boost::timer> KGM_TIMER;
 
@@ -565,11 +569,18 @@ void iterateStack(ugraph& g, i_dfs_stack& inactiveDfsStack, dfs_stack& dfsStack,
 
 int main(int argc, char ** argv) {
 
-    if (argc <= 1)
+    if (argc <= 2)
     {
         std::cerr << "Not enough arguments." << std::endl;
         return -1;
     }
+    istringstream(argv[2]) >> NUMBER_OF_THREADS;
+    if (NUMBER_OF_THREADS <= 0  || NUMBER_OF_THREADS > 256)
+    {
+        std::cerr << "Number of threads is out of <1,256>." << std::endl;
+        return -1;
+    }
+
 
     std::string filename (argv[1]);
 	if (filename.empty())
@@ -581,9 +592,15 @@ int main(int argc, char ** argv) {
 	i_dfs_stack inactiveDfsStack;
 	dfs_stack dfsStack;
 	degree_stack degreeStack;
+
     KGM_TIMER.reset(new boost::timer);
-    int startTime, endTime, totalTime;
-    startTime = time(NULL);
+
+    timespec startWTime, endWTime;
+    long int totalWTime;
+    int totalWTimeSec;
+
+
+    clock_gettime(CLOCK_MONOTONIC, &startWTime);
 
 	#pragma omp parallel \
 		private(inactiveDfsStack,dfsStack,degreeStack) \
@@ -605,12 +622,14 @@ int main(int argc, char ** argv) {
 		iterateStack(g, inactiveDfsStack, dfsStack, degreeStack, running);
     }
 
-    endTime = time(NULL);
-	totalTime = endTime - startTime;
+    clock_gettime(CLOCK_MONOTONIC, &endWTime);
+    totalWTime = (endWTime.tv_nsec-startWTime.tv_nsec);
+    totalWTimeSec = endWTime.tv_sec-startWTime.tv_sec;
 
 	std::cout << ": *****************************************" << std::endl;
-	std::cout << ": ***** CPU TIME : " << KGM_TIMER->elapsed() << std::endl;
-	std::cout << ": ***** REAL TIME : " << totalTime << std::endl;
+	std::cout << ": ***** CPU TIME (s): " << KGM_TIMER->elapsed() << std::endl;
+	std::cout << ": ***** REAL TIME (s): " << totalWTimeSec << std::endl;
+	std::cout << ": ***** REAL TIME (ns): " << totalWTime << std::endl;
 	std::cout << ": ***** THREADS: " << NUMBER_OF_THREADS << std::endl;
 	std::cout << ": ***** DEGREE: " << finalDegree << std::endl;
 	std::cout << ": ***** SPANNING TREE: " << finalInactiveDfsStack << finalDfsStack << std::endl;
