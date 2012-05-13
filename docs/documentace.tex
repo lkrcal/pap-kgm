@@ -8,6 +8,7 @@
 \usepackage{stmaryrd}
 \usepackage{pifont}
 \usepackage{hyperref}
+\usepackage{pdfpages}
 
 \newcommand\fnurl[2]{%
   \href{#2}{#1}\footnote{\url{#2}}%
@@ -106,25 +107,18 @@ Měření probíhala na lokálním počítači pro různé úlohy a konfigurace 
 
 Jako další vhodné optimalizační experimenty lze provést změnu datových struktur sloužících k uložení stavu, případně navrhnout dynamické škálování bloků podproblémů.
 
-\begin{table}
-\begin{center}
-    \begin{tabular}{ | c | c | c |}
-    \hline
-    \multicolumn{3}{|c|}{Intel(R) Core(TM) i7-2620M CPU @ 2.70GHz} \\ \hline
-    \hline	
-Threads	&CPU Time	&Real Time \\ \hline
-1	&61.35	&62        \\ \hline
-2	&68.43	&35        \\ \hline
-4	&87.89	&27        \\ \hline
-8	&89.59	&28        \\ \hline
-16	&88.89	&26        \\ \hline
-32	&91.94	&27        \\ \hline
-64	&93.02	&27        \\ \hline
-    \end{tabular}
-\caption{Meření A - celý stavový prostor}
-\end{center}
-\end{table}
 
+\section{CUDA paralelní implementace}
+
+\subsection{Struktura algoritmu}
+
+Implementace prohledávání do hloubky je založena na paralelním výběru posledních stavů ze zásobníku, jejich následné expanzi a uložení následníku na zásobník. K tomuto se používá paralelní prefixový součet přes počet následníků káždého stavu. Výsledek PPS slouží jako index k ukládání těchto stavů na zásobník.
+
+Zásobník je uložen v globální paměti, protože sdílená pamět nemá dostatečnou velikost. Jako možná výlepšení se nabízí omezení velikosti zásobníku a jeho použití pouze k vyvažování práce mezi vlákny (tak jako OpenMP řešení).
+
+\subsection{Měření}
+
+Testování probíhalo na GeForce 9500M GS, cuda 1.1.
 
 
 \section{Závěr}
@@ -148,5 +142,8 @@ Threads	&CPU Time	&Real Time \\ \hline
        
        
  \end{thebibliography}
+
+\section{Příloha A}
+\includepdf[pages={-}]{results-omp.pdf}
 
 \end{document}
